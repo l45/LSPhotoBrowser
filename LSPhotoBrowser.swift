@@ -400,10 +400,16 @@ private class Animation: NSObject, UIViewControllerAnimatedTransitioning {
     }
 }
 
+private enum PlaceholderRatio: Equatable {
+    case NotBegin      // 没有开始下载
+    case IsLoading     // 正在下载
+    case HasDone       // 下载已完成
+}
+
 private enum HighQualityRatio: Equatable {
     case NotBegin      // 没有开始下载
-    case HasDone       // 下载已完成
     case Ratio(Int)    // 进度，[0,100]
+    case HasDone       // 下载已完成
     
     static func ==(lhs: HighQualityRatio, rhs: HighQualityRatio) -> Bool {
         switch (lhs, rhs) {
@@ -444,6 +450,9 @@ class LSPhotoBrowser: UIViewController {
     fileprivate var pageLabel: UILabel?
     fileprivate var highQualityButton: UIButton?
     fileprivate var bottomView: UIView?
+    fileprivate var activityIndicator: UIActivityIndicatorView!
+    fileprivate var hideStatusViews: Bool = false
+    fileprivate var placeholderRecorder: [PlaceholderRatio]! // 占位图索引
     fileprivate var highQualityRecorder: [HighQualityRatio]! // 高清图索引
     
     /// 高清图展示方式，有点击“查看原图”加载和直接加载两种，默认点击按钮加载
@@ -501,6 +510,7 @@ class LSPhotoBrowser: UIViewController {
 
         self.view.backgroundColor = UIColor.black
         
+        self.placeholderRecorder = [PlaceholderRatio].init(repeating: .NotBegin, count: self.imageCount)
         self.highQualityRecorder = [HighQualityRatio].init(repeating: .NotBegin, count: self.imageCount)
         
         var frame = self.view.bounds
@@ -526,6 +536,10 @@ class LSPhotoBrowser: UIViewController {
         bottomView!.frame = CGRect(x: 0, y: self.view.bounds.height - 54, width: self.view.bounds.width, height: 54)
         // TODO: 设置颜色渐变，这个是作为其他功能按钮(暂时没有)背景用的
         self.view.addSubview(bottomView!)
+        
+        self.activityIndicator = UIActivityIndicatorView.init(activityIndicatorStyle: .white)
+        self.view.addSubview(activityIndicator!)
+        activityIndicator!.center = self.view.bounds.center
         
         self.pageLabel = UILabel.init()
         pageLabel!.frame = CGRect(x: 0, y: 16, width: self.view.bounds.width, height:15)
@@ -557,6 +571,32 @@ class LSPhotoBrowser: UIViewController {
         }
     }
     
+    fileprivate func asyncSetPlaceholderImage(forIndexPath indexPath: IndexPath, url: String) {
+        let index = indexPath.item
+        guard self.placeholderRecorder[index] == .NotBegin else {
+            return
+        }
+        self.placeholderRecorder[index] = .IsLoading
+        if index == self.currentImageIndex {
+            self.setupActivityIndicatorView()
+        }
+        
+        self.getImageDelegate.LSPhotoBrowser_asyncLoadImage(url, progress: nil, completion: { (image) in
+            self.placeholderRecorder[index] = .HasDone
+            if index == self.currentImageIndex {
+                self.setupActivityIndicatorView()
+            }
+            guard image != nil else {
+                return
+            }
+            DispatchQueue.after(0.03, block: {
+                if let cell = self.collectionView.cellForItem(at: indexPath) as? Cell {
+                    cell.setPlaceholder(image)
+                }
+            })
+        })
+    }
+    
     fileprivate func asyncSetHighQualityImage(forIndexPath indexPath: IndexPath, url: String) {
         let index = indexPath.item
         guard self.highQualityRecorder[index] == .NotBegin else {
@@ -564,7 +604,7 @@ class LSPhotoBrowser: UIViewController {
         }
         self.highQualityRecorder[index] = .Ratio(0)
         if index == self.currentImageIndex {
-            self.scrollViewDidScroll(self.collectionView)
+            self.setupHighQualityButton()
         }
         
         self.getImageDelegate.LSPhotoBrowser_asyncLoadImage(url, progress: { (receivedSize, expectedSize) in
@@ -582,12 +622,13 @@ class LSPhotoBrowser: UIViewController {
             let ratio = 100 * receivedSize / expectedSize
             self.highQualityRecorder[index] = .Ratio(ratio)
             if index == self.currentImageIndex {
-                self.scrollViewDidScroll(self.collectionView)
+                self.setupHighQualityButton()
             }
         }, completion: { (image) in
             self.highQualityRecorder[index] = .HasDone
             if index == self.currentImageIndex {
-                self.scrollViewDidScroll(self.collectionView)
+                self.setupHighQualityButton()
+                self.setupActivityIndicatorView()
             }
             guard image != nil else {
                 return
@@ -630,6 +671,7 @@ class LSPhotoBrowser: UIViewController {
         }
         return (nil, nil)
     }
+    
     fileprivate func getHighQualityImage(_ index: Int) -> (UIImage?, String?) {
         if let image = self.delegate.photoBrowser?(self, highQualityImageForIndex: index) {
             return (image, nil)
@@ -642,6 +684,43 @@ class LSPhotoBrowser: UIViewController {
             }
         }
         return (nil, nil)
+    }
+    
+    fileprivate func setupHighQualityButton() {
+        guard let highQualityButton = self.highQualityButton else {
+            return
+        }
+        if !self.hideStatusViews {
+            switch self.highQualityRecorder[self.currentImageIndex] {
+            case .NotBegin:
+                highQualityButton.isHidden = false
+                highQualityButton.setTitle(highQualityTitle, for: .normal)
+            case .HasDone:
+                highQualityButton.isHidden = true
+            case .Ratio(let rrrr):
+                highQualityButton.isHidden = false
+                highQualityButton.setTitle("\(rrrr)%", for: .normal)
+            }
+        } else {
+            highQualityButton.isHidden = true
+        }
+    }
+    
+    fileprivate func setupActivityIndicatorView() {
+        guard let activityIndicator = self.activityIndicator else {
+            return
+        }
+        if self.hideStatusViews ||
+            self.placeholderRecorder[self.currentImageIndex] == .HasDone ||
+            self.highQualityRecorder[self.currentImageIndex] == .HasDone {
+            if activityIndicator.isAnimating {
+                activityIndicator.stopAnimating()
+            }
+        } else {
+            if !activityIndicator.isAnimating {
+                activityIndicator.startAnimating()
+            }
+        }
     }
 }
 
@@ -674,23 +753,10 @@ extension LSPhotoBrowser: UICollectionViewDelegate {
         let temp0 = Double(scrollView.contentOffset.x / scrollView.bounds.width)
         self.currentImageIndex = Int(temp0 + 0.5)
         self.pageLabel?.text = "\(self.currentImageIndex+1) / \(self.imageCount)"
-        if let highQualityButton = self.highQualityButton {
-            let temp1 = temp0 - floor(temp0)
-            if (temp1 >= 0.95 || temp1 <= 0.05) {
-                switch self.highQualityRecorder[self.currentImageIndex] {
-                case .NotBegin:
-                    highQualityButton.isHidden = false
-                    highQualityButton.setTitle(highQualityTitle, for: .normal)
-                case .HasDone:
-                    highQualityButton.isHidden = true
-                case .Ratio(let rrrr):
-                    highQualityButton.isHidden = false
-                    highQualityButton.setTitle("\(rrrr)%", for: .normal)
-                }
-            } else {
-                highQualityButton.isHidden = true
-            }
-        }
+        let temp1 = temp0 - floor(temp0)
+        self.hideStatusViews = temp1 > 0.05 && temp1 < 0.95
+        self.setupHighQualityButton()
+        self.setupActivityIndicatorView()
     }
     
     func collectionView(_ collectionView: UICollectionView,
@@ -711,36 +777,30 @@ extension LSPhotoBrowser: UICollectionViewDelegate {
         // 0
         cell.setPlaceholder(nil)
         
-        let (HI, HU) = self.getHighQualityImage(index)
-        if let image = HI {
+        let (hi, hu) = self.getHighQualityImage(index)
+        if let image = hi {
             // 1
             self.highQualityRecorder[index] = .HasDone
+            self.setupHighQualityButton()
+            self.setupActivityIndicatorView()
             cell.setHighQuality(image)
-            self.scrollViewDidScroll(collectionView)
             return
         }
-        if let url = HU, self.highQualityMode == .Auto {
+        if let url = hu, self.highQualityMode == .Auto {
             // 2
             self.asyncSetHighQualityImage(forIndexPath: indexPath, url: url)
         }
-        let (PI, PU) = self.getPlaceholderImage(index)
-        if let image = PI {
+        let (pi, pu) = self.getPlaceholderImage(index)
+        if let image = pi {
             // 3
+            self.placeholderRecorder[index] = .HasDone
+            self.setupActivityIndicatorView()
             cell.setPlaceholder(image)
             return
         }
-        if let url = PU {
+        if let url = pu {
             // 4
-            self.getImageDelegate.LSPhotoBrowser_asyncLoadImage(url, progress: nil, completion: { (image) in
-                guard image != nil else {
-                    return
-                }
-                DispatchQueue.after(0.03, block: {
-                    if let cell = self.collectionView.cellForItem(at: indexPath) as? Cell {
-                        cell.setPlaceholder(image)
-                    }
-                })
-            })
+            self.asyncSetPlaceholderImage(forIndexPath: indexPath, url: url)
         }
     }
 }
