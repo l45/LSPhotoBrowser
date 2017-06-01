@@ -35,17 +35,26 @@ private protocol GetImageDelegate: NSObjectProtocol {
     /// 同步获取缓存
     func LSPhotoBrowser_getCacheImage(_ url: String) -> UIImage?
     /// 异步加载图片
-    func LSPhotoBrowser_asyncLoadImage(_ url: String, progress: ((Int, Int)->Void)?, completion: @escaping (UIImage?)->Void)
+    func LSPhotoBrowser_asyncLoadImage(_ url: String, progress: ((Progress)->Void)?, completion: @escaping (UIImage?)->Void)
 }
 
 extension LSWebImage: GetImageDelegate {
-    func LSPhotoBrowser_getCacheImage(_ url: String) -> UIImage? {
+    fileprivate func LSPhotoBrowser_getCacheImage(_ url: String) -> UIImage? {
         return self.getFromMemoryAndDisk(forURL: url)
     }
-    func LSPhotoBrowser_asyncLoadImage(_ url: String, progress: ((Int, Int) -> Void)?, completion: @escaping (UIImage?) -> Void) {
-        self.asyncLoad(withURL: url, progress: progress, completed: { (image, error, _, _, _) in
+    fileprivate func LSPhotoBrowser_asyncLoadImage(_ url: String, progress: ((Progress) -> Void)?, completion: @escaping (UIImage?) -> Void) {
+        self.asyncLoad(withURL: url, progress: { (receivedSize, expectedSize) in
+            guard let progress = progress else { return }
+            var receivedSize = receivedSize, expectedSize = expectedSize
+            if receivedSize < 0 { receivedSize = 0 }
+            if expectedSize <= 0 { expectedSize = 1 }
+            if expectedSize < receivedSize { expectedSize = receivedSize }
+            let p = Progress.init(totalUnitCount: Int64(expectedSize))
+            p.completedUnitCount = Int64(receivedSize)
+            progress(p)
+        }) { (image, error, _, _, _) in
             completion(image)
-        })
+        }
     }
 }
 
@@ -451,7 +460,14 @@ class LSPhotoBrowser: UIViewController {
     fileprivate var highQualityButton: UIButton?
     fileprivate var bottomView: UIView?
     fileprivate var activityIndicator: UIActivityIndicatorView!
-    fileprivate var hideStatusViews: Bool = false
+    fileprivate var hideStatusViews: Bool = false {
+        didSet {
+            if hideStatusViews != oldValue {
+                self.setupHighQualityButton()
+                self.setupActivityIndicatorView()
+            }
+        }
+    }
     fileprivate var placeholderRecorder: [PlaceholderRatio]! // 占位图索引
     fileprivate var highQualityRecorder: [HighQualityRatio]! // 高清图索引
     
@@ -562,12 +578,13 @@ class LSPhotoBrowser: UIViewController {
             highQualityButton!.titleLabel?.font = UIFont.systemFont(ofSize: 13)
             highQualityButton!.backgroundColor = UIColor.init(white: 0, alpha: 0.3)
             highQualityButton!.layer.cornerRadius = 3
-            highQualityButton!.layer.borderColor = UIColor.white.cgColor
+            highQualityButton!.layer.borderColor = UIColor.init(white: 0.5, alpha: 0.85).cgColor
             highQualityButton!.layer.borderWidth = 1
             highQualityButton!.clipsToBounds = true
             highQualityButton!.addTarget(self, action: #selector(self.hightQualityButtonDidClicked), for: .touchDown)
             self.view.addSubview(highQualityButton!)
             highQualityButton!.isHidden = false
+            highQualityButton!.alpha = 0
         }
     }
     
@@ -607,24 +624,15 @@ class LSPhotoBrowser: UIViewController {
             self.setupHighQualityButton()
         }
         
-        self.getImageDelegate.LSPhotoBrowser_asyncLoadImage(url, progress: { (receivedSize, expectedSize) in
-            var receivedSize = receivedSize
-            var expectedSize = expectedSize
-            if receivedSize < 0 {
-                receivedSize = 0
-            }
-            if expectedSize <= 0 {
-                expectedSize = 1
-            }
-            if expectedSize < receivedSize {
-                expectedSize = receivedSize
-            }
-            let ratio = 100 * receivedSize / expectedSize
+        self.getImageDelegate.LSPhotoBrowser_asyncLoadImage(url, progress: { (progress) in
+            let ratio = Int(Double(progress.completedUnitCount) / Double(progress.totalUnitCount) * 100)
+            print(progress.localizedDescription)
+            print(progress.localizedAdditionalDescription)
             self.highQualityRecorder[index] = .Ratio(ratio)
             if index == self.currentImageIndex {
                 self.setupHighQualityButton()
             }
-        }, completion: { (image) in
+        }) { (image) in
             self.highQualityRecorder[index] = .HasDone
             if index == self.currentImageIndex {
                 self.setupHighQualityButton()
@@ -638,7 +646,7 @@ class LSPhotoBrowser: UIViewController {
                     cell.setHighQuality(image)
                 }
             })
-        })
+        }
     }
     
     fileprivate func tap() {
@@ -686,6 +694,90 @@ class LSPhotoBrowser: UIViewController {
         return (nil, nil)
     }
     
+    private enum HighQualityButtonStatus {
+        case Hidden
+        case WillShow
+        case Showing
+        case Shown
+        case Hiding
+    }
+    
+    @objc private func gotoShowingTimerFireMethod(_ timer: Timer) {
+        UIView.animate(withDuration: 0.4) {
+            self.highQualityButton?.alpha = 1
+        }
+        self.buttonStatus = .Showing
+        self.buttonTimer?.invalidate()
+        self.buttonTimer = Timer.init(timeInterval: 0.4, target: self, selector: #selector(self.gotoShownTimerFireMethod(_:)), userInfo: nil, repeats: false)
+        RunLoop.current.add(self.buttonTimer!, forMode: .commonModes)
+    }
+    @objc private func gotoHiddenTimerFireMethod(_ timer: Timer) {
+        self.buttonStatus = .Hidden
+        self.buttonTimer?.invalidate()
+        self.buttonTimer = nil
+        self.highQualityButtonStatusChange()
+    }
+    @objc private func gotoShownTimerFireMethod(_ timer: Timer) {
+        self.buttonStatus = .Shown
+        self.buttonTimer?.invalidate()
+        self.buttonTimer = nil
+        self.highQualityButtonStatusChange()
+    }
+    
+    private var buttonStatus: HighQualityButtonStatus = .Hidden
+    private var buttonStatusAction: Bool? = nil {
+        didSet {
+            if (buttonStatusAction == true && oldValue != true) ||
+                (buttonStatusAction == false && oldValue != false) {
+                self.highQualityButtonStatusChange()
+            }
+        }
+    }
+    private var buttonTimer: Timer?
+    private func highQualityButtonStatusChange() {
+        guard let action = self.buttonStatusAction else {
+            return
+        }
+        self.buttonStatusAction = nil
+        switch self.buttonStatus {
+        case .Hidden:
+            if action {
+                self.buttonStatus = .WillShow
+                self.buttonTimer?.invalidate()
+                self.buttonTimer = Timer.init(timeInterval: 0.2, target: self, selector: #selector(self.gotoShowingTimerFireMethod(_:)), userInfo: nil, repeats: false)
+                RunLoop.current.add(self.buttonTimer!, forMode: .commonModes)
+            }
+            break
+        case .WillShow:
+            if action {
+                self.buttonTimer?.invalidate()
+                self.buttonTimer = Timer.init(timeInterval: 0.2, target: self, selector: #selector(self.gotoShowingTimerFireMethod(_:)), userInfo: nil, repeats: false)
+                RunLoop.current.add(self.buttonTimer!, forMode: .commonModes)
+            } else {
+                self.buttonStatus = .Hidden
+                self.buttonTimer?.invalidate()
+                self.buttonTimer = nil
+                self.highQualityButtonStatusChange()
+            }
+            break
+        case .Showing:
+            break
+        case .Shown:
+            if !action {
+                UIView.animate(withDuration: 0.2) {
+                    self.highQualityButton?.alpha = 0
+                }
+                self.buttonStatus = .Hiding
+                self.buttonTimer?.invalidate()
+                self.buttonTimer = Timer.init(timeInterval: 0.2, target: self, selector: #selector(self.gotoHiddenTimerFireMethod(_:)), userInfo: nil, repeats: false)
+                RunLoop.current.add(self.buttonTimer!, forMode: .commonModes)
+            }
+            break
+        case .Hiding:
+            break
+        }
+    }
+    
     fileprivate func setupHighQualityButton() {
         guard let highQualityButton = self.highQualityButton else {
             return
@@ -693,16 +785,16 @@ class LSPhotoBrowser: UIViewController {
         if !self.hideStatusViews {
             switch self.highQualityRecorder[self.currentImageIndex] {
             case .NotBegin:
-                highQualityButton.isHidden = false
                 highQualityButton.setTitle(highQualityTitle, for: .normal)
+                self.buttonStatusAction = true
             case .HasDone:
-                highQualityButton.isHidden = true
+                self.buttonStatusAction = false
             case .Ratio(let rrrr):
-                highQualityButton.isHidden = false
                 highQualityButton.setTitle("\(rrrr)%", for: .normal)
+                self.buttonStatusAction = true
             }
         } else {
-            highQualityButton.isHidden = true
+            self.buttonStatusAction = false
         }
     }
     
@@ -750,13 +842,10 @@ extension LSPhotoBrowser: UICollectionViewDataSource {
 
 extension LSPhotoBrowser: UICollectionViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        let temp0 = Double(scrollView.contentOffset.x / scrollView.bounds.width)
-        self.currentImageIndex = Int(temp0 + 0.5)
+        let offsetX = Double(scrollView.contentOffset.x / scrollView.bounds.width)
+        self.currentImageIndex = Int(offsetX + 0.5)
         self.pageLabel?.text = "\(self.currentImageIndex+1) / \(self.imageCount)"
-        let temp1 = temp0 - floor(temp0)
-        self.hideStatusViews = temp1 > 0.05 && temp1 < 0.95
-        self.setupHighQualityButton()
-        self.setupActivityIndicatorView()
+        self.hideStatusViews = abs(offsetX - Double(self.currentImageIndex)) > 0.01
     }
     
     func collectionView(_ collectionView: UICollectionView,
@@ -786,6 +875,7 @@ extension LSPhotoBrowser: UICollectionViewDelegate {
             cell.setHighQuality(image)
             return
         }
+        self.setupHighQualityButton()
         if let url = hu, self.highQualityMode == .Auto {
             // 2
             self.asyncSetHighQualityImage(forIndexPath: indexPath, url: url)
